@@ -7,8 +7,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from ultralytics.utils.torch_utils import fuse_conv_and_bn
 
+from ultralytics.utils.torch_utils import fuse_conv_and_bn
+from ultralytics.nn.modules.conv import CBAM
 from .conv import Conv, DWConv, GhostConv, LightConv, RepConv, autopad
 from .transformer import TransformerBlock
 
@@ -279,6 +280,28 @@ class C2(nn.Module):
         a, b = self.cv1(x).chunk(2, 1)
         return self.cv2(torch.cat((self.m(a), b), 1))
 
+class BottleneckCBAM(nn.Module):
+    def __init__(self, c1, c2, shortcut=True, g=1, k=((3,3),(3,3)), e=1.0):
+        super().__init__()
+        hidden = int(c2 * e)
+
+        # mengikuti struktur YOLO: Conv1x1 → Conv3x3
+        self.cv1 = Conv(c1, hidden, 1, 1)
+        self.cv2 = Conv(hidden, c2, k[0], 1, g=g)
+
+        # Tambah CBAM setelah konvolusi ke-2
+        self.cbam = CBAM(c2)
+
+        self.add = shortcut and c1 == c2
+
+    def forward(self, x):
+        y = self.cv1(x)
+        y = self.cv2(y)
+
+        # CBAM sebelum residual
+        y = self.cbam(y)
+
+        return x + y if self.add else y
 
 class C2f(nn.Module):
     """Faster Implementation of CSP Bottleneck with 2 convolutions."""
@@ -298,7 +321,9 @@ class C2f(nn.Module):
         self.c = int(c2 * e)  # hidden channels
         self.cv1 = Conv(c1, 2 * self.c, 1, 1)
         self.cv2 = Conv((2 + n) * self.c, c2, 1)  # optional act=FReLU(c2)
-        self.m = nn.ModuleList(Bottleneck(self.c, self.c, shortcut, g, k=((3, 3), (3, 3)), e=1.0) for _ in range(n))
+        self.m = nn.ModuleList(
+        BottleneckCBAM(self.c, self.c, shortcut, g, k=((3,3),(3,3)), e=1.0)
+        for _ in range(n))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass through C2f layer."""
